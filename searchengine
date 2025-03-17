@@ -1,0 +1,441 @@
+import time
+import argparse
+import json
+from typing import List, Dict, Any, Optional
+import duckdb
+from fastapi import FastAPI, Query, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress
+import asyncio
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+# Define response models
+class Domain(BaseModel):
+    domain: str
+    nameservers: str
+    ip: str
+    country: str
+    server: str
+    field5: Optional[str] = None
+    field6: Optional[str] = None
+    field7: Optional[str] = None
+    field8: Optional[str] = None
+
+class SearchResponse(BaseModel):
+    results: List[Domain]
+    total: int
+    total_in_db: int
+    query_time_ms: float
+    
+class SearchStats(BaseModel):
+    total_rows: int
+    indexed_fields: List[str]
+    estimated_query_time_ms: float
+    db_size_mb: float
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Domain Search API",
+    description="High-performance domain search engine for 200M+ records",
+    version="2.0"
+)
+
+# Enable CORS for the frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Console for CLI output
+console = Console()
+
+# Thread pool for concurrent queries
+executor = ThreadPoolExecutor(max_workers=8)
+
+# Database connection pool
+class DBConnectionPool:
+    def __init__(self, db_path: str, pool_size: int = 5):
+        self.db_path = db_path
+        self.pool_size = pool_size
+        self.connections = []
+        self.available = []
+        self.initialize_pool()
+        
+    def initialize_pool(self):
+        for _ in range(self.pool_size):
+            conn = duckdb.connect(self.db_path)
+            conn.execute("SET threads TO 4")  # Distribute threads across connections
+            conn.execute("PRAGMA memory_limit='16%'")  # Limit memory per connection
+            self.connections.append(conn)
+            self.available.append(conn)
+    
+    async def get_connection(self):
+        # Wait for an available connection
+        while not self.available:
+            await asyncio.sleep(0.01)
+        
+        conn = self.available.pop(0)
+        return conn
+    
+    def release_connection(self, conn):
+        self.available.append(conn)
+    
+    def close_all(self):
+        for conn in self.connections:
+            conn.close()
+
+# Global connection pool
+connection_pool = None
+
+def get_connection_pool(db_path: str):
+    global connection_pool
+    if connection_pool is None:
+        connection_pool = DBConnectionPool(db_path)
+    return connection_pool
+
+# Helper function to optimize query execution
+def optimize_query(query_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Optimize query parameters for better performance."""
+    optimized = {}
+    
+    # Apply wildcards more efficiently
+    for key, value in query_params.items():
+        if value:
+            if isinstance(value, str) and value.startswith('%') and value.endswith('%'):
+                # Convert LIKE '%text%' to ILIKE when possible for better performance
+                if value.count('%') == 2:
+                    inner_text = value[1:-1]
+                    if len(inner_text) > 3:  # Only apply for reasonable length substrings
+                        optimized[key] = {'op': 'ilike', 'value': value}
+                        continue
+            
+            # Use exact match optimization
+            optimized[key] = {'op': 'exact', 'value': value}
+    
+    return optimized
+
+# Function to execute search using thread pool
+async def execute_search(
+    query_params: Dict[str, Any],
+    limit: int,
+    offset: int,
+    db_path: str
+):
+    pool = get_connection_pool(db_path)
+    conn = await pool.get_connection()
+    
+    try:
+        # Optimize the query
+        optimized_params = optimize_query(query_params)
+        
+        # Build the SQL query
+        conditions = []
+        params = []
+        
+        for key, value_info in optimized_params.items():
+            if value_info['op'] == 'ilike':
+                conditions.append(f"{key} ILIKE ?")
+                params.append(value_info['value'])
+            elif value_info['op'] == 'exact':
+                value = value_info['value']
+                if '%' in value:
+                    conditions.append(f"{key} LIKE ?")
+                else:
+                    conditions.append(f"{key} = ?")
+                params.append(value)
+        
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        
+        # First get the count with a separate query for accuracy
+        count_sql = f"SELECT COUNT(*) FROM domains WHERE {where_clause}"
+        
+        # Get count and results in parallel
+        loop = asyncio.get_event_loop()
+        
+        # Execute query to get total count
+        total_future = loop.run_in_executor(
+            executor, 
+            lambda: conn.execute(count_sql, params).fetchone()[0]
+        )
+        
+        # Get total rows in database for context
+        total_db_future = loop.run_in_executor(
+            executor,
+            lambda: conn.execute("SELECT COUNT(*) FROM domains").fetchone()[0]
+        )
+        
+        # Main query with limit and offset
+        results_sql = f"SELECT * FROM domains WHERE {where_clause} ORDER BY domain LIMIT ? OFFSET ?"
+        params_with_limit = params + [limit, offset]
+        
+        # Execute the main query to get results
+        results_future = loop.run_in_executor(
+            executor,
+            lambda: conn.execute(results_sql, params_with_limit).fetchall()
+        )
+        
+        # Wait for all queries to complete
+        total, total_rows, result_rows = await asyncio.gather(
+            total_future, total_db_future, results_future
+        )
+        
+        # Convert to list of dictionaries
+        columns = [col[0] for col in conn.description]
+        results = [dict(zip(columns, row)) for row in result_rows]
+        
+        return {
+            'results': results,
+            'total': total,
+            'total_in_db': total_rows
+        }
+        
+    finally:
+        pool.release_connection(conn)
+
+# CLI interface
+def parse_args():
+    parser = argparse.ArgumentParser(description='High-performance domain search')
+    parser.add_argument('--db-path', type=str, default='domains.duckdb', 
+                        help='Path to DuckDB file')
+    parser.add_argument('--api', action='store_true', help='Start the API server')
+    parser.add_argument('--port', type=int, default=8000, help='API server port')
+    parser.add_argument('--threads', type=int, default=4, help='Number of DuckDB threads')
+    parser.add_argument('--memory-limit', type=str, default='80%', 
+                        help='Memory limit for DuckDB')
+    
+    # Search parameters
+    parser.add_argument('--domain', type=str, help='Search by domain')
+    parser.add_argument('--ip', type=str, help='Search by IP address')
+    parser.add_argument('--country', type=str, help='Search by country code')
+    parser.add_argument('--server', type=str, help='Search by server type')
+    parser.add_argument('--nameservers', type=str, help='Search by nameservers')
+    parser.add_argument('--limit', type=int, default=20, help='Limit results')
+    parser.add_argument('--offset', type=int, default=0, help='Offset results')
+    parser.add_argument('--json', action='store_true', help='Output in JSON format')
+    
+    return parser.parse_args()
+
+# CLI search function
+def cli_search(args):
+    # Connect to database
+    conn = duckdb.connect(args.db_path)
+    conn.execute(f"SET threads TO {args.threads}")
+    conn.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
+    
+    # Build query parameters
+    query_params = {
+        'domain': args.domain,
+        'ip': args.ip,
+        'country': args.country,
+        'server': args.server,
+        'nameservers': args.nameservers
+    }
+    # Remove None values
+    query_params = {k: v for k, v in query_params.items() if v is not None}
+    
+    # Optimize the query
+    optimized_params = optimize_query(query_params)
+    
+    # Build the SQL query
+    conditions = []
+    params = []
+    
+    for key, value_info in optimized_params.items():
+        if value_info['op'] == 'ilike':
+            conditions.append(f"{key} ILIKE ?")
+            params.append(value_info['value'])
+        elif value_info['op'] == 'exact':
+            value = value_info['value']
+            if '%' in value:
+                conditions.append(f"{key} LIKE ?")
+            else:
+                conditions.append(f"{key} = ?")
+            params.append(value)
+    
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    
+    # Execute a count query first to get total matching records
+    with Progress(transient=True) as progress:
+        count_task = progress.add_task("[yellow]Counting matches...", total=1)
+        
+        count_start = time.time()
+        count_sql = f"SELECT COUNT(*) FROM domains WHERE {where_clause}"
+        total_matches = conn.execute(count_sql, params).fetchone()[0]
+        count_time = (time.time() - count_start) * 1000
+        
+        progress.update(count_task, completed=1)
+    
+    # Now execute the main query with limit and offset
+    with Progress(transient=True) as progress:
+        search_task = progress.add_task("[green]Fetching results...", total=1)
+        
+        results_sql = f"SELECT * FROM domains WHERE {where_clause} ORDER BY domain LIMIT ? OFFSET ?"
+        params_with_limit = params + [args.limit, args.offset]
+        
+        search_start = time.time()
+        result = conn.execute(results_sql, params_with_limit).fetchall()
+        search_time = (time.time() - search_start) * 1000
+        
+        progress.update(search_task, completed=1)
+    
+    # Get the total number of rows in the database for context
+    total_rows = conn.execute("SELECT COUNT(*) FROM domains").fetchone()[0]
+    
+    # Convert to list of dictionaries
+    columns = [col[0] for col in conn.description]
+    results = [dict(zip(columns, row)) for row in result]
+    
+    total_time = count_time + search_time
+    
+    # Output results
+    if args.json:
+        print(json.dumps({
+            'results': results,
+            'total_matches': total_matches,
+            'total_in_database': total_rows,
+            'query_time_ms': total_time,
+            'page': args.offset // args.limit + 1,
+            'limit': args.limit,
+            'offset': args.offset
+        }, indent=2))
+    else:
+        # Print a header with stats
+        console.print(f"\n[bold green]Search Results[/bold green] - [bold]{total_matches:,}[/bold] matches found")
+        console.print(f"Showing {min(args.limit, len(results)):,} results (page {args.offset // args.limit + 1})")
+        console.print(f"Query completed in [bold]{total_time:.2f}ms[/bold] ({count_time:.2f}ms to count, {search_time:.2f}ms to fetch)")
+        
+        if results:
+            table = Table(show_header=True, header_style="bold magenta")
+            
+            # Add columns (keep display cleaner by selecting key columns)
+            display_columns = ["domain", "ip", "country", "server", "nameservers"]
+            for column in display_columns:
+                if column in results[0]:
+                    table.add_column(column)
+            
+            # Add rows
+            for result in results:
+                row_values = []
+                for column in display_columns:
+                    if column in result:
+                        # Truncate long values for display
+                        value = str(result[column])
+                        if column == "nameservers" and len(value) > 50:
+                            value = value[:47] + "..."
+                        row_values.append(value)
+                
+                table.add_row(*row_values)
+            
+            console.print(table)
+            
+            # Show pagination info if there are more results
+            if total_matches > args.limit:
+                pages = (total_matches + args.limit - 1) // args.limit
+                current_page = args.offset // args.limit + 1
+                console.print(f"\nPage {current_page} of {pages} • {total_matches:,} total records")
+                
+                # Show pagination help
+                if current_page < pages:
+                    next_offset = args.offset + args.limit
+                    console.print(f"\nFor next page: --offset {next_offset}")
+        else:
+            console.print("\n[yellow]No results found matching your criteria.[/yellow]")
+    
+    # Close connection
+    conn.close()
+
+# API routes
+@app.get("/search", response_model=SearchResponse)
+async def search_api(
+    domain: Optional[str] = Query(None, description="Domain name (supports % wildcards)"),
+    ip: Optional[str] = Query(None, description="IP address"),
+    country: Optional[str] = Query(None, description="Country code"),
+    server: Optional[str] = Query(None, description="Server type"),
+    nameservers: Optional[str] = Query(None, description="Nameservers (supports % wildcards)"),
+    limit: int = Query(20, ge=1, le=1000, description="Maximum number of results"),
+    offset: int = Query(0, ge=0, description="Result offset"),
+    db_path: str = Query("domains.duckdb", description="Database path")
+):
+    if not any([domain, ip, country, server, nameservers]):
+        raise HTTPException(status_code=400, detail="At least one search parameter is required")
+    
+    # Build query parameters
+    query_params = {
+        'domain': domain,
+        'ip': ip,
+        'country': country,
+        'server': server,
+        'nameservers': nameservers
+    }
+    # Remove None values
+    query_params = {k: v for k, v in query_params.items() if v is not None}
+    
+    # Perform search
+    start_time = time.time()
+    results_data = await execute_search(query_params, limit, offset, db_path)
+    query_time = (time.time() - start_time) * 1000  # in milliseconds
+    
+    return {
+        'results': results_data['results'],
+        'total': results_data['total'],
+        'total_in_db': results_data['total_in_db'],
+        'query_time_ms': query_time
+    }
+
+@app.get("/stats", response_model=SearchStats)
+async def get_stats(db_path: str = Query("domains.duckdb", description="Database path")):
+    pool = get_connection_pool(db_path)
+    conn = await pool.get_connection()
+    
+    try:
+        # Get total rows
+        total_rows = conn.execute("SELECT COUNT(*) FROM domains").fetchone()[0]
+        
+        # Get index information
+        indexes = conn.execute("PRAGMA indices").fetchall()
+        indexed_fields = [idx[2] for idx in indexes if idx[0] == 'domains']
+        
+        # Get table size
+        db_size = conn.execute("SELECT pg_table_size('domains')").fetchone()[0]
+        db_size_mb = db_size / (1024 * 1024)
+        
+        # Run a benchmark query to estimate performance
+        bench_start = time.time()
+        conn.execute("SELECT COUNT(*) FROM domains WHERE country='US'").fetchone()
+        bench_time = (time.time() - bench_start) * 1000
+        
+        return {
+            'total_rows': total_rows,
+            'indexed_fields': indexed_fields,
+            'estimated_query_time_ms': bench_time,
+            'db_size_mb': db_size_mb
+        }
+    finally:
+        pool.release_connection(conn)
+
+@app.on_event("shutdown")
+def shutdown_event():
+    if connection_pool:
+        connection_pool.close_all()
+
+def main():
+    args = parse_args()
+    
+    if args.api:
+        # Start API server with configured connection pool
+        get_connection_pool(args.db_path)  # Initialize pool
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
+    else:
+        # Run CLI search
+        cli_search(args)
+
+if __name__ == "__main__":
+    main()

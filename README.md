@@ -67,8 +67,9 @@ python parallel-search.py --domain "%.com" --limit 50
 
 # Complex compound query
 python parallel-search.py --domain "%.org" --country "US" --server "Apache" --limit 20
+```
 
-########################################################### randon ################
+
 # DuckDB Parallel Loader Documentation
 
 ## Overview

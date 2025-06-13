@@ -13,7 +13,6 @@ For optimal performance when processing 217 million records (25GB dataset):
 | CPU | 4 cores | 8+ cores | 16+ cores |
 | RAM | 16GB | 32GB | 64GB+ |
 | Storage | 100GB SSD | 250GB NVMe SSD | 500GB+ NVMe SSD |
-| Network (for multi-node) | 1 Gbps | 10 Gbps | 25+ Gbps |
 
 ## Ultra-Fast Loading Process
 
